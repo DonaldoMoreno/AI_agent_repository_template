@@ -1,0 +1,138 @@
+name: FixBot (auto-fix PR CI failures)
+
+on:
+  workflow_run:
+    workflows: ["Build"]   # <-- el nombre EXACTO de tu workflow de CI principal (ej. build.yml -> "Build")
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: fixbot-${{ github.event.workflow_run.pull_requests[0].number }}
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.pull_requests[0].number != null
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Identify PR
+        id: pr
+        run: |
+          echo "pr_number=${{ github.event.workflow_run.pull_requests[0].number }}" >> $GITHUB_OUTPUT
+          echo "head_sha=${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
+          echo "head_ref=${{ github.event.workflow_run.pull_requests[0].head.ref }}" >> $GITHUB_OUTPUT
+          echo "head_repo_full_name=${{ github.event.workflow_run.pull_requests[0].head.repo.full_name }}" >> $GITHUB_OUTPUT
+          echo "run_id=${{ github.event.workflow_run.id }}" >> $GITHUB_OUTPUT
+
+      - name: Checkout repository (default)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout PR branch or detect fork
+        id: checkout_pr
+        run: |
+          pr=${{ steps.pr.outputs.pr_number }}
+          head_repo="${{ steps.pr.outputs.head_repo_full_name }}"
+          echo "head_repo=${head_repo}" >&2
+          if [ "$head_repo" != "${{ github.repository }}" ]; then
+            echo "is_fork=true" >> $GITHUB_OUTPUT
+            echo "head_repo=${head_repo}" >> $GITHUB_OUTPUT
+            echo "PR comes from a fork; will not attempt to push back to forked repo." >&2
+            exit 0
+          fi
+          echo "is_fork=false" >> $GITHUB_OUTPUT
+          echo "head_repo=${head_repo}" >> $GITHUB_OUTPUT
+          git fetch origin refs/pull/${pr}/head:pr-${pr}
+          git checkout pr-${pr}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Fetch failing logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .github/scripts/fixbot_fetch_logs.py \
+            --repo "${{ github.repository }}" \
+            --run-id "${{ steps.pr.outputs.run_id }}" \
+            --out ".fixbot_logs.txt"
+
+      - name: Run FixBot (generate patch)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python .github/scripts/fixbot_generate_patch.py \
+            --logs ".fixbot_logs.txt" \
+            --repo-root "." \
+            --out ".fixbot.patch"
+
+      - name: Apply patch
+        if: steps.checkout_pr.outputs.is_fork == 'false'
+        run: |
+          git apply --whitespace=fix .fixbot.patch
+
+      - name: Try build (Ubuntu quick check)
+        if: steps.checkout_pr.outputs.is_fork == 'false'
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Commit & push changes to PR branch
+        if: steps.checkout_pr.outputs.is_fork == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git config user.name "fixbot"
+          git config user.email "fixbot@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix CI: minimal patch from logs"
+          git push
+
+      - name: Comment on PR (success)
+        if: steps.checkout_pr.outputs.is_fork == 'false' && success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .github/scripts/fixbot_comment.py \
+            --repo "${{ github.repository }}" \
+            --pr "${{ steps.pr.outputs.pr_number }}" \
+            --message "✅ FixBot pushed a minimal CI fix commit. Please re-check CI."
+
+      - name: Comment with generated patch (forked PR)
+        if: steps.checkout_pr.outputs.is_fork == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          patch_file=".fixbot.patch"
+          if [ -f "$patch_file" ]; then
+            head=$(head -c 4000 "$patch_file" | sed 's/`/\\`/g')
+            python .github/scripts/fixbot_comment.py \
+              --repo "${{ github.repository }}" \
+              --pr "${{ steps.pr.outputs.pr_number }}" \
+              --message "⚠️ FixBot detected this PR comes from a fork and cannot push fixes. Generated patch (truncated):\n\n$head"
+          else
+            python .github/scripts/fixbot_comment.py \
+              --repo "${{ github.repository }}" \
+              --pr "${{ steps.pr.outputs.pr_number }}" \
+              --message "⚠️ FixBot could not generate a patch."
+          fi
